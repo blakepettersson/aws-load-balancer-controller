@@ -6,6 +6,7 @@ import (
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	ec2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/ec2"
@@ -13,27 +14,29 @@ import (
 )
 
 // NewSecurityGroupSynthesizer constructs new securityGroupSynthesizer.
-func NewSecurityGroupSynthesizer(ec2Client services.EC2, trackingProvider tracking.Provider, taggingManager TaggingManager,
+func NewSecurityGroupSynthesizer(ec2Client services.EC2, trackingProvider tracking.Provider, taggingManager TaggingManager, elbTaggingManager elbv2.TaggingManager,
 	sgManager SecurityGroupManager, vpcID string, logger logr.Logger, stack core.Stack) *securityGroupSynthesizer {
 	return &securityGroupSynthesizer{
-		ec2Client:        ec2Client,
-		trackingProvider: trackingProvider,
-		taggingManager:   taggingManager,
-		sgManager:        sgManager,
-		vpcID:            vpcID,
-		logger:           logger,
-		stack:            stack,
-		unmatchedSDKSGs:  nil,
+		ec2Client:         ec2Client,
+		trackingProvider:  trackingProvider,
+		taggingManager:    taggingManager,
+		elbTaggingManager: elbTaggingManager,
+		sgManager:         sgManager,
+		vpcID:             vpcID,
+		logger:            logger,
+		stack:             stack,
+		unmatchedSDKSGs:   nil,
 	}
 }
 
 type securityGroupSynthesizer struct {
-	ec2Client        services.EC2
-	trackingProvider tracking.Provider
-	taggingManager   TaggingManager
-	sgManager        SecurityGroupManager
-	vpcID            string
-	logger           logr.Logger
+	ec2Client         services.EC2
+	trackingProvider  tracking.Provider
+	taggingManager    TaggingManager
+	elbTaggingManager elbv2.TaggingManager
+	sgManager         SecurityGroupManager
+	vpcID             string
+	logger            logr.Logger
 
 	stack           core.Stack
 	unmatchedSDKSGs []networking.SecurityGroupInfo
@@ -72,6 +75,39 @@ func (s *securityGroupSynthesizer) Synthesize(ctx context.Context) error {
 }
 
 func (s *securityGroupSynthesizer) PostSynthesize(ctx context.Context) error {
+	/*
+		lbs, err := s.findSDKLoadBalancers(ctx)
+
+		if err != nil {
+			return err
+		}
+
+		unmatchedSDKSGMap := make(map[string]struct{})
+		for _, sg := range s.unmatchedSDKSGs {
+			unmatchedSDKSGMap[sg.SecurityGroupID] = struct{}{}
+		}
+
+		s.logger.Info("Unmatched security group(s)", "securityGroups", unmatchedSDKSGMap)
+
+		for _, lb := range lbs {
+			oldSGs := lb.LoadBalancer.SecurityGroups
+			var currentSGs []*string
+
+			for _, sg := range oldSGs {
+				_, ok := unmatchedSDKSGMap[*sg]
+				if !ok && sg != nil {
+					currentSGs = append(currentSGs, sg)
+				}
+			}
+
+			s.logger.Info("Setting security group(s) on", "loadbalancer", lb.LoadBalancer.LoadBalancerArn, "securityGroups", currentSGs)
+
+			// TODO: Add check if len(currentSGs) == 0
+			//lb.LoadBalancer.SetSecurityGroups(currentSGs)
+
+			//s.ec2Client.
+		}*/
+
 	for _, sdkSG := range s.unmatchedSDKSGs {
 		if err := s.sgManager.Delete(ctx, sdkSG); err != nil {
 			return err
@@ -85,6 +121,15 @@ func (s *securityGroupSynthesizer) findSDKSecurityGroups(ctx context.Context) ([
 	stackTags := s.trackingProvider.StackTags(s.stack)
 	stackTagsLegacy := s.trackingProvider.StackTagsLegacy(s.stack)
 	return s.taggingManager.ListSecurityGroups(ctx,
+		tracking.TagsAsTagFilter(stackTags),
+		tracking.TagsAsTagFilter(stackTagsLegacy))
+}
+
+// findSDKLoadBalancers will find all AWS LoadBalancers created for stack.
+func (s *securityGroupSynthesizer) findSDKLoadBalancers(ctx context.Context) ([]elbv2.LoadBalancerWithTags, error) {
+	stackTags := s.trackingProvider.StackTags(s.stack)
+	stackTagsLegacy := s.trackingProvider.StackTagsLegacy(s.stack)
+	return s.elbTaggingManager.ListLoadBalancers(ctx,
 		tracking.TagsAsTagFilter(stackTags),
 		tracking.TagsAsTagFilter(stackTagsLegacy))
 }

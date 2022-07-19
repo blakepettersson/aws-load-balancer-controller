@@ -14,12 +14,13 @@ import (
 
 // NewTargetGroupSynthesizer constructs targetGroupSynthesizer
 func NewTargetGroupSynthesizer(elbv2Client services.ELBV2, trackingProvider tracking.Provider, taggingManager TaggingManager,
-	tgManager TargetGroupManager, logger logr.Logger, stack core.Stack) *targetGroupSynthesizer {
+	tgManager TargetGroupManager, listenerManager ListenerManager, logger logr.Logger, stack core.Stack) *targetGroupSynthesizer {
 	return &targetGroupSynthesizer{
 		elbv2Client:      elbv2Client,
 		trackingProvider: trackingProvider,
 		taggingManager:   taggingManager,
 		tgManager:        tgManager,
+		listenerManager:  listenerManager,
 		logger:           logger,
 		stack:            stack,
 		unmatchedSDKTGs:  nil,
@@ -32,6 +33,7 @@ type targetGroupSynthesizer struct {
 	trackingProvider tracking.Provider
 	taggingManager   TaggingManager
 	tgManager        TargetGroupManager
+	listenerManager  ListenerManager
 	logger           logr.Logger
 
 	stack           core.Stack
@@ -73,6 +75,25 @@ func (s *targetGroupSynthesizer) Synthesize(ctx context.Context) error {
 
 func (s *targetGroupSynthesizer) PostSynthesize(ctx context.Context) error {
 	for _, sdkTG := range s.unmatchedSDKTGs {
+		for _, loadBalancerArn := range sdkTG.TargetGroup.LoadBalancerArns {
+			listeners, err := s.taggingManager.ListListeners(ctx, *loadBalancerArn)
+
+			if err != nil {
+				return err
+			}
+
+			for _, listener := range listeners {
+				for _, action := range listener.Listener.DefaultActions {
+					if action.TargetGroupArn == sdkTG.TargetGroup.TargetGroupArn {
+						err := s.listenerManager.Delete(ctx, listener)
+						if err != nil {
+							return err
+						}
+					}
+				}
+			}
+		}
+
 		if err := s.tgManager.Delete(ctx, sdkTG); err != nil {
 			return err
 		}

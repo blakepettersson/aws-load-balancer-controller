@@ -3,6 +3,7 @@ package elbv2
 import (
 	"context"
 	"github.com/pkg/errors"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/elbv2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 )
 
@@ -30,6 +31,47 @@ func NewLoadBalancer(stack core.Stack, id string, spec LoadBalancerSpec) *LoadBa
 	stack.AddResource(lb)
 	lb.registerDependencies(stack)
 	return lb
+}
+
+func NewLoadBalancerFromSDKLoadBalancer(stack core.Stack, id string, sdkLB elbv2.LoadBalancerWithTags) *LoadBalancer {
+	lb := sdkLB.LoadBalancer
+	scheme := LoadBalancerScheme(*lb.Scheme)
+	addressType := IPAddressType(*lb.IpAddressType)
+	balancerType := LoadBalancerType(*lb.Type)
+	var sgs []core.StringToken
+
+	var mappings []SubnetMapping
+	for _, zone := range lb.AvailabilityZones {
+		if len(zone.LoadBalancerAddresses) > 0 {
+			for _, address := range zone.LoadBalancerAddresses {
+				mappings = append(mappings, SubnetMapping{
+					AllocationID:       address.AllocationId,
+					PrivateIPv4Address: address.PrivateIPv4Address,
+					SubnetID:           *zone.SubnetId,
+				})
+			}
+		} else {
+			mappings = append(mappings, SubnetMapping{
+				SubnetID: *zone.SubnetId,
+			})
+		}
+	}
+
+	for _, group := range lb.SecurityGroups {
+		sgs = append(sgs, core.LiteralStringToken(*group))
+	}
+
+	return NewLoadBalancer(stack, id,
+		LoadBalancerSpec{
+			Name:                  *lb.LoadBalancerName,
+			Type:                  balancerType,
+			Scheme:                &scheme,
+			Tags:                  sdkLB.Tags,
+			IPAddressType:         &addressType,
+			CustomerOwnedIPv4Pool: lb.CustomerOwnedIpv4Pool,
+			SecurityGroups:        sgs,
+			SubnetMappings:        mappings,
+		})
 }
 
 // SetStatus sets the LoadBalancer's status

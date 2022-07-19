@@ -51,6 +51,8 @@ func (s *loadBalancerSynthesizer) Synthesize(ctx context.Context) error {
 		return err
 	}
 
+	s.logger.Info("reslbs", "resLBs", resLBs)
+
 	matchedResAndSDKLBs, unmatchedResLBs, unmatchedSDKLBs, err := matchResAndSDKLoadBalancers(resLBs, sdkLBs, s.trackingProvider.ResourceIDTagKey())
 	if err != nil {
 		return err
@@ -68,7 +70,19 @@ func (s *loadBalancerSynthesizer) Synthesize(ctx context.Context) error {
 				if err = s.lbManager.Delete(ctx, sdkLB); err != nil {
 					return err
 				}
+
+				return nil
 			}
+
+			// The LB can't be deleted; let's try to instead update the security groups
+			lb := elbv2model.NewLoadBalancerFromSDKLoadBalancer(s.stack, "LoadBalancer", sdkLB)
+			lb.Spec.SecurityGroups = []core.StringToken{core.LiteralStringToken("sg-0e0ac34e477a6a5a2")}
+			lbStatus, err := s.lbManager.Update(ctx, lb, sdkLB)
+			if err != nil {
+				return err
+			}
+
+			lb.SetStatus(lbStatus)
 		}
 	}
 	for _, resLB := range unmatchedResLBs {
