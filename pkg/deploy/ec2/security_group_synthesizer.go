@@ -84,9 +84,23 @@ func (s *securityGroupSynthesizer) PostSynthesize(ctx context.Context) error {
 func (s *securityGroupSynthesizer) findSDKSecurityGroups(ctx context.Context) ([]networking.SecurityGroupInfo, error) {
 	stackTags := s.trackingProvider.StackTags(s.stack)
 	stackTagsLegacy := s.trackingProvider.StackTagsLegacy(s.stack)
-	return s.taggingManager.ListSecurityGroups(ctx,
+	groups, err := s.taggingManager.ListSecurityGroups(ctx,
 		tracking.TagsAsTagFilter(stackTags),
 		tracking.TagsAsTagFilter(stackTagsLegacy))
+	if err != nil {
+		return groups, err
+	}
+
+	var securityGroups []networking.SecurityGroupInfo
+
+	for _, group := range groups {
+		_, ok := group.Tags["empty"]
+		if !ok {
+			securityGroups = append(securityGroups, group)
+		}
+	}
+
+	return securityGroups, nil
 }
 
 type resAndSDKSecurityGroupPair struct {

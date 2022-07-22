@@ -2,6 +2,8 @@ package elbv2
 
 import (
 	"context"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/ec2"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
 	"strings"
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
@@ -12,6 +14,7 @@ import (
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
+	ec2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/ec2"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 )
 
@@ -20,25 +23,29 @@ const (
 )
 
 // NewLoadBalancerSynthesizer constructs loadBalancerSynthesizer
-func NewLoadBalancerSynthesizer(elbv2Client services.ELBV2, trackingProvider tracking.Provider, taggingManager TaggingManager,
-	lbManager LoadBalancerManager, logger logr.Logger, stack core.Stack) *loadBalancerSynthesizer {
+func NewLoadBalancerSynthesizer(elbv2Client services.ELBV2, trackingProvider tracking.Provider, taggingManager TaggingManager, ec2TaggingManager ec2.TaggingManager,
+	sgManager ec2.SecurityGroupManager, lbManager LoadBalancerManager, logger logr.Logger, stack core.Stack) *loadBalancerSynthesizer {
 	return &loadBalancerSynthesizer{
-		elbv2Client:      elbv2Client,
-		trackingProvider: trackingProvider,
-		taggingManager:   taggingManager,
-		lbManager:        lbManager,
-		logger:           logger,
-		stack:            stack,
+		elbv2Client:       elbv2Client,
+		trackingProvider:  trackingProvider,
+		taggingManager:    taggingManager,
+		ec2TaggingManager: ec2TaggingManager,
+		sgManager:         sgManager,
+		lbManager:         lbManager,
+		logger:            logger,
+		stack:             stack,
 	}
 }
 
 // loadBalancerSynthesizer is responsible for synthesize LoadBalancer resources types for certain stack.
 type loadBalancerSynthesizer struct {
-	elbv2Client      services.ELBV2
-	trackingProvider tracking.Provider
-	taggingManager   TaggingManager
-	lbManager        LoadBalancerManager
-	logger           logr.Logger
+	elbv2Client       services.ELBV2
+	trackingProvider  tracking.Provider
+	taggingManager    TaggingManager
+	sgManager         ec2.SecurityGroupManager
+	ec2TaggingManager ec2.TaggingManager
+	lbManager         LoadBalancerManager
+	logger            logr.Logger
 
 	stack core.Stack
 }
@@ -50,8 +57,6 @@ func (s *loadBalancerSynthesizer) Synthesize(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	s.logger.Info("reslbs", "resLBs", resLBs)
 
 	matchedResAndSDKLBs, unmatchedResLBs, unmatchedSDKLBs, err := matchResAndSDKLoadBalancers(resLBs, sdkLBs, s.trackingProvider.ResourceIDTagKey())
 	if err != nil {
@@ -75,14 +80,10 @@ func (s *loadBalancerSynthesizer) Synthesize(ctx context.Context) error {
 			}
 
 			// The LB can't be deleted; let's try to instead update the security groups
-			lb := elbv2model.NewLoadBalancerFromSDKLoadBalancer(s.stack, "LoadBalancer", sdkLB)
-			lb.Spec.SecurityGroups = []core.StringToken{core.LiteralStringToken("sg-0e0ac34e477a6a5a2")}
-			lbStatus, err := s.lbManager.Update(ctx, lb, sdkLB)
+			err = s.resetLBSecurityGroups(ctx, sdkLB)
 			if err != nil {
 				return err
 			}
-
-			lb.SetStatus(lbStatus)
 		}
 	}
 	for _, resLB := range unmatchedResLBs {
@@ -102,6 +103,87 @@ func (s *loadBalancerSynthesizer) Synthesize(ctx context.Context) error {
 	return nil
 }
 
+func (s *loadBalancerSynthesizer) resetLBSecurityGroups(ctx context.Context, sdkLB LoadBalancerWithTags) error {
+	lb := newLoadBalancerFromSDKLoadBalancer(s.stack, "LoadBalancer", sdkLB)
+
+	if len(lb.Spec.SecurityGroups) > 0 {
+		sg, err := s.findSDKSecurityGroup(ctx)
+		if err != nil {
+			return err
+		}
+
+		s.logger.Info("Security group", "sg", sg)
+
+		var sgId core.StringToken
+
+		if sg != nil {
+			sgId = core.LiteralStringToken(sg.SecurityGroupID)
+		} else {
+			ec2SG, err := s.sgManager.Create(ctx, ec2model.NewSecurityGroup(s.stack, "ManagedLBSecurityGroup", ec2model.SecurityGroupSpec{
+				GroupName:   "something",
+				Description: "A dummy SG",
+				Tags:        map[string]string{"empty": "true"},
+			}))
+			if err != nil {
+				return err
+			}
+			sgId = core.LiteralStringToken(ec2SG.GroupID)
+		}
+
+		lb.Spec.SecurityGroups = []core.StringToken{sgId}
+
+		lbStatus, err := s.lbManager.Update(ctx, lb, sdkLB)
+		if err != nil {
+			return err
+		}
+
+		lb.SetStatus(lbStatus)
+	}
+
+	return nil
+}
+
+func newLoadBalancerFromSDKLoadBalancer(stack core.Stack, id string, sdkLB LoadBalancerWithTags) *elbv2model.LoadBalancer {
+	lb := sdkLB.LoadBalancer
+	scheme := elbv2model.LoadBalancerScheme(*lb.Scheme)
+	addressType := elbv2model.IPAddressType(*lb.IpAddressType)
+	balancerType := elbv2model.LoadBalancerType(*lb.Type)
+	var sgs []core.StringToken
+
+	var mappings []elbv2model.SubnetMapping
+	for _, zone := range lb.AvailabilityZones {
+		if len(zone.LoadBalancerAddresses) > 0 {
+			for _, address := range zone.LoadBalancerAddresses {
+				mappings = append(mappings, elbv2model.SubnetMapping{
+					AllocationID:       address.AllocationId,
+					PrivateIPv4Address: address.PrivateIPv4Address,
+					SubnetID:           *zone.SubnetId,
+				})
+			}
+		} else {
+			mappings = append(mappings, elbv2model.SubnetMapping{
+				SubnetID: *zone.SubnetId,
+			})
+		}
+	}
+
+	for _, group := range lb.SecurityGroups {
+		sgs = append(sgs, core.LiteralStringToken(*group))
+	}
+
+	return elbv2model.NewLoadBalancer(stack, id,
+		elbv2model.LoadBalancerSpec{
+			Name:                  *lb.LoadBalancerName,
+			Type:                  balancerType,
+			Scheme:                &scheme,
+			Tags:                  sdkLB.Tags,
+			IPAddressType:         &addressType,
+			CustomerOwnedIPv4Pool: lb.CustomerOwnedIpv4Pool,
+			SecurityGroups:        sgs,
+			SubnetMappings:        mappings,
+		})
+}
+
 func (s *loadBalancerSynthesizer) disableDeletionProtection(lb *elbv2sdk.LoadBalancer) error {
 	input := &elbv2sdk.ModifyLoadBalancerAttributesInput{
 		Attributes: []*elbv2sdk.LoadBalancerAttribute{
@@ -119,6 +201,36 @@ func (s *loadBalancerSynthesizer) disableDeletionProtection(lb *elbv2sdk.LoadBal
 func (s *loadBalancerSynthesizer) PostSynthesize(ctx context.Context) error {
 	// nothing to do here.
 	return nil
+}
+
+// findSDKSecurityGroups will find all AWS SecurityGroups created for stack.
+func (s *loadBalancerSynthesizer) findSDKSecurityGroup(ctx context.Context) (*networking.SecurityGroupInfo, error) {
+	stackTags := s.trackingProvider.StackTags(s.stack)
+	stackTagsLegacy := s.trackingProvider.StackTagsLegacy(s.stack)
+
+	groups, err := s.ec2TaggingManager.ListSecurityGroups(ctx,
+		tracking.TagsAsTagFilter(appendEmptyTag(stackTags)),
+		tracking.TagsAsTagFilter(appendEmptyTag(stackTagsLegacy)),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(groups) > 0 {
+		return &groups[0], nil
+	}
+
+	return nil, nil
+}
+
+func appendEmptyTag(tmp map[string]string) map[string]string {
+	stackTags := make(map[string]string, len(tmp)+1)
+	for k, v := range tmp {
+		stackTags[k] = v
+	}
+	stackTags["empty"] = "true"
+	return stackTags
 }
 
 // findSDKLoadBalancers will find all AWS LoadBalancer created for stack.
