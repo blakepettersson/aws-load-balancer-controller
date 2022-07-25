@@ -8,8 +8,11 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/ec2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
+	"sigs.k8s.io/aws-load-balancer-controller/pkg/ingress"
 	coremodel "sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
+	ec2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/ec2"
 	elbv2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/elbv2"
 )
 
@@ -20,15 +23,19 @@ type LoadBalancerManager interface {
 	Update(ctx context.Context, resLB *elbv2model.LoadBalancer, sdkLB LoadBalancerWithTags) (elbv2model.LoadBalancerStatus, error)
 
 	Delete(ctx context.Context, sdkLB LoadBalancerWithTags) error
+
+	Reset(ctx context.Context, sdkLB LoadBalancerWithTags, stack coremodel.Stack) (elbv2model.LoadBalancerStatus, error)
 }
 
 // NewDefaultLoadBalancerManager constructs new defaultLoadBalancerManager.
 func NewDefaultLoadBalancerManager(elbv2Client services.ELBV2, trackingProvider tracking.Provider,
-	taggingManager TaggingManager, externalManagedTags []string, logger logr.Logger) *defaultLoadBalancerManager {
+	taggingManager TaggingManager, sgManager ec2.SecurityGroupManager, listenerManager ListenerManager, externalManagedTags []string, logger logr.Logger) *defaultLoadBalancerManager {
 	return &defaultLoadBalancerManager{
 		elbv2Client:          elbv2Client,
 		trackingProvider:     trackingProvider,
 		taggingManager:       taggingManager,
+		sgManager:            sgManager,
+		listenerManager:      listenerManager,
 		attributesReconciler: NewDefaultLoadBalancerAttributeReconciler(elbv2Client, logger),
 		externalManagedTags:  externalManagedTags,
 		logger:               logger,
@@ -42,6 +49,8 @@ type defaultLoadBalancerManager struct {
 	elbv2Client          services.ELBV2
 	trackingProvider     tracking.Provider
 	taggingManager       TaggingManager
+	sgManager            ec2.SecurityGroupManager
+	listenerManager      ListenerManager
 	attributesReconciler LoadBalancerAttributeReconciler
 	externalManagedTags  []string
 
@@ -112,6 +121,93 @@ func (m *defaultLoadBalancerManager) Delete(ctx context.Context, sdkLB LoadBalan
 	m.logger.Info("deleted loadBalancer",
 		"arn", awssdk.StringValue(req.LoadBalancerArn))
 	return nil
+}
+
+func (m *defaultLoadBalancerManager) Reset(ctx context.Context, sdkLB LoadBalancerWithTags, stack coremodel.Stack) (elbv2model.LoadBalancerStatus, error) {
+	lb := m.newLoadBalancerFromSDKLoadBalancer(sdkLB, stack)
+
+	listeners, err := m.elbv2Client.DescribeListenersAsList(ctx, &elbv2sdk.DescribeListenersInput{
+		LoadBalancerArn: sdkLB.LoadBalancer.LoadBalancerArn,
+	})
+
+	if err != nil {
+		return elbv2model.LoadBalancerStatus{}, err
+	}
+
+	for _, listener := range listeners {
+		err = m.listenerManager.Delete(ctx, ListenerWithTags{Listener: listener})
+		if err != nil {
+			return elbv2model.LoadBalancerStatus{}, err
+		}
+	}
+
+	if len(lb.Spec.SecurityGroups) > 0 {
+		spec := ec2model.SecurityGroupSpec{
+			Description: "A dummy SG",
+			Tags:        map[string]string{"empty": "true"},
+		}
+
+		group := ingress.NewGroupIDForExplicitGroup(stack.StackID().Name)
+		spec.SetManagedGroupName("wat", ingress.Group{ID: group})
+		sg, err := m.sgManager.Upsert(ctx, spec, stack)
+
+		if err != nil {
+			return elbv2model.LoadBalancerStatus{}, err
+		}
+
+		lb.Spec.SecurityGroups = []coremodel.StringToken{coremodel.LiteralStringToken(sg.GroupID)}
+
+		lbStatus, err := m.Update(ctx, lb, sdkLB)
+		if err != nil {
+			return elbv2model.LoadBalancerStatus{}, err
+		}
+
+		lb.Status = &lbStatus
+		return lbStatus, nil
+	}
+
+	return elbv2model.LoadBalancerStatus{}, nil
+}
+
+func (m *defaultLoadBalancerManager) newLoadBalancerFromSDKLoadBalancer(sdkLB LoadBalancerWithTags, stack coremodel.Stack) *elbv2model.LoadBalancer {
+	lb := sdkLB.LoadBalancer
+	scheme := elbv2model.LoadBalancerScheme(*lb.Scheme)
+	addressType := elbv2model.IPAddressType(*lb.IpAddressType)
+	balancerType := elbv2model.LoadBalancerType(*lb.Type)
+	var sgs []coremodel.StringToken
+
+	var mappings []elbv2model.SubnetMapping
+	for _, zone := range lb.AvailabilityZones {
+		if len(zone.LoadBalancerAddresses) > 0 {
+			for _, address := range zone.LoadBalancerAddresses {
+				mappings = append(mappings, elbv2model.SubnetMapping{
+					AllocationID:       address.AllocationId,
+					PrivateIPv4Address: address.PrivateIPv4Address,
+					SubnetID:           *zone.SubnetId,
+				})
+			}
+		} else {
+			mappings = append(mappings, elbv2model.SubnetMapping{
+				SubnetID: *zone.SubnetId,
+			})
+		}
+	}
+
+	for _, group := range lb.SecurityGroups {
+		sgs = append(sgs, coremodel.LiteralStringToken(*group))
+	}
+
+	return elbv2model.NewLoadBalancer(stack, "LoadBalancer",
+		elbv2model.LoadBalancerSpec{
+			Name:                  *lb.LoadBalancerName,
+			Type:                  balancerType,
+			Scheme:                &scheme,
+			Tags:                  sdkLB.Tags,
+			IPAddressType:         &addressType,
+			CustomerOwnedIPv4Pool: lb.CustomerOwnedIpv4Pool,
+			SecurityGroups:        sgs,
+			SubnetMappings:        mappings,
+		})
 }
 
 func (m *defaultLoadBalancerManager) updateSDKLoadBalancerWithIPAddressType(ctx context.Context, resLB *elbv2model.LoadBalancer, sdkLB LoadBalancerWithTags) error {

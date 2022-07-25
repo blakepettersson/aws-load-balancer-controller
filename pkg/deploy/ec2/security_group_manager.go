@@ -9,6 +9,7 @@ import (
 	"github.com/pkg/errors"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/aws/services"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/deploy/tracking"
+	coremodel "sigs.k8s.io/aws-load-balancer-controller/pkg/model/core"
 	ec2model "sigs.k8s.io/aws-load-balancer-controller/pkg/model/ec2"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/networking"
 	"sigs.k8s.io/aws-load-balancer-controller/pkg/runtime"
@@ -23,6 +24,8 @@ const (
 // SecurityGroupManager is responsible for create/update/delete SecurityGroup resources.
 type SecurityGroupManager interface {
 	Create(ctx context.Context, resSG *ec2model.SecurityGroup) (ec2model.SecurityGroupStatus, error)
+
+	Upsert(ctx context.Context, resSG ec2model.SecurityGroupSpec, stack coremodel.Stack) (ec2model.SecurityGroupStatus, error)
 
 	Update(ctx context.Context, resSG *ec2model.SecurityGroup, sdkSG networking.SecurityGroupInfo) (ec2model.SecurityGroupStatus, error)
 
@@ -58,6 +61,39 @@ type defaultSecurityGroupManager struct {
 
 	waitSGDeletionPollInterval time.Duration
 	waitSGDeletionTimeout      time.Duration
+}
+
+func (m *defaultSecurityGroupManager) Upsert(ctx context.Context, spec ec2model.SecurityGroupSpec, stack coremodel.Stack) (ec2model.SecurityGroupStatus, error) {
+	stackTags := m.trackingProvider.StackTags(stack)
+	stackTagsLegacy := m.trackingProvider.StackTagsLegacy(stack)
+
+	groups, err := m.taggingManager.ListSecurityGroups(ctx,
+		tracking.TagsAsTagFilter(appendEmptyTag(stackTags)),
+		tracking.TagsAsTagFilter(appendEmptyTag(stackTagsLegacy)),
+	)
+
+	if err != nil {
+		return ec2model.SecurityGroupStatus{}, err
+	}
+
+	if len(groups) > 1 {
+		return ec2model.SecurityGroupStatus{}, errors.New("multiple security groups found, can only upsert one")
+	}
+
+	if len(groups) > 0 {
+		return m.Update(ctx, ec2model.NewSecurityGroup(stack, "ManagedLBSecurityGroup", spec), groups[0])
+	}
+
+	return m.Create(ctx, ec2model.NewSecurityGroup(stack, "ManagedLBSecurityGroup", spec))
+}
+
+func appendEmptyTag(tmp map[string]string) map[string]string {
+	stackTags := make(map[string]string, len(tmp)+1)
+	for k, v := range tmp {
+		stackTags[k] = v
+	}
+	stackTags["empty"] = "true"
+	return stackTags
 }
 
 func (m *defaultSecurityGroupManager) Create(ctx context.Context, resSG *ec2model.SecurityGroup) (ec2model.SecurityGroupStatus, error) {
